@@ -1,0 +1,17 @@
+.next/
+out/
+node_modules/
+.env*
+!.env.example
+data/
+/director/
+*.log
+*.tsbuildinfo
+.DS_Store
+.idea
+
+# local build & ops artifacts
+build/
+.local-backups/
+isolation/
+_md5_*.txt

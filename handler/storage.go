@@ -1,0 +1,362 @@
+package handler
+
+import (
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/fzheng466/infinite-canvas/config"
+	"github.com/fzheng466/infinite-canvas/model"
+	"github.com/fzheng466/infinite-canvas/service"
+	"gorm.io/gorm"
+)
+
+// StorageConfig 返回公开存储配置。
+func StorageConfig(w http.ResponseWriter, r *http.Request) {
+	config, err := service.PublicStorageConfig()
+	if err != nil {
+		FailError(w, err)
+		return
+	}
+	OK(w, config)
+}
+
+// SaveUserStorageProvider 保存用户配置的存储提供商。
+func SaveUserStorageProvider(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		Provider service.UserStorageProviders `json:"provider"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		Fail(w, "配置内容格式错误")
+		return
+	}
+	config, err := service.SaveCurrentUserStorageProvider(r.Context(), request.Provider)
+	if err != nil {
+		FailError(w, err)
+		return
+	}
+	OK(w, config)
+}
+
+// MeasureUserStorageProvider 统计用户存储提供商的已用容量。
+func MeasureUserStorageProvider(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		Provider service.StorageObjectProviderInput `json:"provider"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		Fail(w, "配置内容格式错误")
+		return
+	}
+	result, err := service.MeasureUserStorageProvider(r.Context(), request.Provider)
+	if err != nil {
+		FailError(w, err)
+		return
+	}
+	OK(w, result)
+}
+
+// UploadFile 上传文件到对象存储。
+func UploadFile(w http.ResponseWriter, r *http.Request) {
+	limit := config.Cfg.StorageMaxImageBytes
+	if limit <= 0 {
+		limit = 32 << 20
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, limit+(1<<20))
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		Fail(w, "请选择要上传的文件")
+		return
+	}
+	defer file.Close()
+	if header.Size > limit {
+		FailWithStatus(w, http.StatusRequestEntityTooLarge, "文件超过大小限制")
+		return
+	}
+	data, err := io.ReadAll(io.LimitReader(file, limit+1))
+	if err != nil {
+		FailError(w, err)
+		return
+	}
+	if int64(len(data)) > limit {
+		FailWithStatus(w, http.StatusRequestEntityTooLarge, "文件超过大小限制")
+		return
+	}
+	contentType := header.Header.Get("Content-Type")
+	if strings.TrimSpace(contentType) == "" {
+		contentType = http.DetectContentType(data)
+	}
+	var provider *service.StorageObjectProviderInput
+	if raw := strings.TrimSpace(r.FormValue("provider")); raw != "" {
+		var parsed service.StorageObjectProviderInput
+		if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+			Fail(w, "用户对象存储配置格式错误")
+			return
+		}
+		provider = &parsed
+	}
+	object, err := service.UploadStorageObjectWithProvider(r.Context(), header.Filename, contentType, data, provider)
+	if err != nil {
+		FailError(w, err)
+		return
+	}
+	OK(w, object)
+}
+
+// RegisterDirectFile 登记浏览器已直传至用户 WebDAV 的文件。
+func RegisterDirectFile(w http.ResponseWriter, r *http.Request) {
+	var request service.DirectStorageObjectInput
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		Fail(w, "文件信息格式错误")
+		return
+	}
+	object, err := service.RegisterDirectStorageObject(r.Context(), request)
+	if err != nil {
+		FailError(w, err)
+		return
+	}
+	OK(w, object)
+}
+
+// DeleteFile 删除文件。
+func DeleteFile(w http.ResponseWriter, r *http.Request, id string) {
+	var request struct {
+		Provider *service.StorageObjectProviderInput `json:"provider"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&request)
+	}
+	if err := service.DeleteStorageObject(r.Context(), id, request.Provider); err != nil {
+		FailError(w, err)
+		return
+	}
+	OK(w, true)
+}
+
+// DeleteDirectFileRecord 删除浏览器已直接删除的 WebDAV 文件索引。
+func DeleteDirectFileRecord(w http.ResponseWriter, r *http.Request, id string) {
+	if err := service.DeleteDirectStorageObjectRecord(r.Context(), id); err != nil {
+		FailError(w, err)
+		return
+	}
+	OK(w, true)
+}
+
+// FileContent 获取文件内容。
+func FileContent(w http.ResponseWriter, r *http.Request, id string) {
+	// ETag/304：图片不可变(对象ID+内容哈希唯一)，命中 If-None-Match 就省掉整次下载。
+	if strings.TrimSpace(r.URL.Query().Get("signature")) == "" {
+		if object, err := service.StorageObjectInfo(r.Context(), id); err == nil {
+				if etag := storageObjectETag(object); etag != "" && etagMatch(r.Header.Get("If-None-Match"), etag) {
+					w.Header().Set("ETag", etag)
+					setPrivateFileCacheHeaders(w)
+					w.WriteHeader(http.StatusNotModified)
+				return
+			}
+		} else {
+			failStorageObjectError(w, err)
+			return
+		}
+	}
+	var download service.DownloadedStorageObject
+	var err error
+	if signature := strings.TrimSpace(r.URL.Query().Get("signature")); signature != "" {
+		download, err = service.DownloadSignedStorageObject(r.Context(), id, r.URL.Query().Get("expires"), signature, r.Header.Get("Range"))
+	} else {
+		download, err = service.DownloadStorageObject(r.Context(), id, r.Header.Get("Range"))
+	}
+	if err != nil {
+		failStorageObjectError(w, err)
+		return
+	}
+	defer download.Stream.Close()
+		w.Header().Set("Content-Type", download.Object.MimeType)
+		setPrivateFileCacheHeaders(w)
+		if etag := storageObjectETag(download.Object); etag != "" {
+			w.Header().Set("ETag", etag)
+		}
+	if download.AcceptRanges {
+		w.Header().Set("Accept-Ranges", "bytes")
+	}
+	if download.ContentRange != "" {
+		w.Header().Set("Content-Range", download.ContentRange)
+	}
+	if download.ContentLength >= 0 {
+		w.Header().Set("Content-Length", strconv.FormatInt(download.ContentLength, 10))
+	}
+	if download.StatusCode != 0 {
+		w.WriteHeader(download.StatusCode)
+	}
+	_, _ = io.Copy(w, download.Stream)
+}
+
+const privateFileCacheControl = "private, max-age=604800, immutable"
+
+func setPrivateFileCacheHeaders(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", privateFileCacheControl)
+	w.Header().Add("Vary", "Authorization")
+	w.Header().Add("Vary", "Cookie")
+}
+
+// storageObjectETag 用「属主 + 内容哈希」构造协商缓存标识。
+// 同一浏览器切换账号时 ETag 会变，避免磁盘缓存把 A 的图直接交给 B。
+func storageObjectETag(object model.StorageObject) string {
+	sum := strings.TrimSpace(object.SHA256)
+	if sum == "" {
+		sum = object.ID
+	}
+	owner := strings.TrimSpace(object.CreatedBy)
+	if owner == "" {
+		return `"` + sum + `"`
+	}
+	return `"` + owner + ":" + sum + `"`
+}
+
+func etagMatch(ifNoneMatch, etag string) bool {
+	if strings.TrimSpace(ifNoneMatch) == "" {
+		return false
+	}
+	for _, candidate := range strings.Split(ifNoneMatch, ",") {
+		if strings.TrimSpace(candidate) == etag || strings.TrimSpace(candidate) == "*" {
+			return true
+		}
+	}
+	return false
+}
+
+// failStorageObjectError 统一映射文件读取错误到正确的 HTTP 状态码。
+func failStorageObjectError(w http.ResponseWriter, err error) {
+	if errors.Is(err, service.ErrStorageObjectTrashed) {
+		FailWithStatus(w, http.StatusGone, "文件已进入回收站")
+		return
+	}
+	if errors.Is(err, service.ErrStorageObjectUnauthenticated) {
+		FailWithStatus(w, http.StatusUnauthorized, "未登录或权限不足")
+		return
+	}
+	if errors.Is(err, service.ErrStorageObjectForbidden) {
+		FailWithStatus(w, http.StatusForbidden, "无权读取该对象")
+		return
+	}
+	if errors.Is(err, service.ErrStorageObjectSignatureInvalid) {
+		FailWithStatus(w, http.StatusUnauthorized, "文件签名无效或已过期")
+		return
+	}
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		FailWithStatus(w, http.StatusNotFound, "文件不存在")
+		return
+	}
+	FailError(w, err)
+}
+
+func SignFileURL(w http.ResponseWriter, r *http.Request, id string) {
+	url, expiresAt, err := service.SignStorageObjectURL(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, service.ErrStorageObjectTrashed) {
+			FailWithStatus(w, http.StatusGone, "文件已进入回收站")
+			return
+		}
+		if errors.Is(err, service.ErrStorageObjectUnauthenticated) {
+			FailWithStatus(w, http.StatusUnauthorized, "未登录或权限不足")
+			return
+		}
+		if errors.Is(err, service.ErrStorageObjectForbidden) {
+			FailWithStatus(w, http.StatusForbidden, "无权读取该对象")
+			return
+		}
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			FailWithStatus(w, http.StatusNotFound, "文件不存在")
+			return
+		}
+		FailError(w, err)
+		return
+	}
+	OK(w, map[string]any{"url": url, "expires_at": expiresAt})
+}
+
+// FileInfo 获取文件元数据。
+func FileInfo(w http.ResponseWriter, r *http.Request, id string) {
+	object, err := service.StorageObjectInfo(r.Context(), id)
+	if err != nil {
+		FailError(w, err)
+		return
+	}
+	OK(w, object)
+}
+
+// AdminMeasureStorageProvider 管理员统计存储容量。
+func AdminMeasureStorageProvider(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		Index    int                    `json:"index"`
+		Provider *model.StorageProvider `json:"provider"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		Fail(w, "配置内容格式错误")
+		return
+	}
+	result, err := service.MeasureAdminStorageProvider(request.Index, request.Provider)
+	if err != nil {
+		FailError(w, err)
+		return
+	}
+	OK(w, result)
+}
+
+// ProxyImage 代理图片请求（解决跨域和机器人检测问题）。
+func ProxyImage(w http.ResponseWriter, r *http.Request) {
+	targetURL := r.URL.Query().Get("url")
+	if targetURL == "" {
+		Fail(w, "url 参数不能为空")
+		return
+	}
+	if !strings.HasPrefix(targetURL, "http://") && !strings.HasPrefix(targetURL, "https://") {
+		Fail(w, "无效的 url")
+		return
+	}
+	client := service.SafeProxyHTTPClient()
+	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
+	if err != nil {
+		FailError(w, err)
+		return
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Pragma", "no-cache")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		FailWithStatus(w, http.StatusBadGateway, "代理图片请求失败")
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		FailWithStatus(w, http.StatusBadGateway, "代理图片请求失败: "+resp.Status)
+		return
+	}
+	contentType := resp.Header.Get("Content-Type")
+	isImage := strings.HasPrefix(contentType, "image/")
+	var data []byte
+	if isImage {
+		data, err = io.ReadAll(resp.Body)
+		if err != nil {
+			FailWithStatus(w, http.StatusBadGateway, "代理图片请求失败")
+			return
+		}
+	}
+	if contentType != "" {
+		w.Header().Set("Content-Type", contentType)
+	} else {
+		w.Header().Set("Content-Type", "application/octet-stream")
+	}
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.WriteHeader(resp.StatusCode)
+	if isImage {
+		_, _ = w.Write(data)
+		return
+	}
+	_, _ = io.Copy(w, resp.Body)
+}
